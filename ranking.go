@@ -291,17 +291,47 @@ func uploadScore(conn *Connection, req *RMCMessage) *RMCMessage {
 	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, nil)
 }
 
-// getRanking answers GetRanking with an empty leaderboard — no scores tracked
-// yet (UploadScore just stores the raw submission, doesn't feed a ranking
-// table). Doesn't bother decoding the request: nothing in it changes an empty
-// answer, and every other method in this file that reaches this point already
-// tolerates a request it can't fully interpret.
+// rankingResult is GetRanking's response. Real bug found via live testing
+// 2026-08-16: this method's return type is RankingResult, a Structure
+// (data List<RankingRankData>, total u32, since_time DateTime) — under NEX
+// 4.0's struct-header framing (types.go's WriteStructure) that means the
+// whole thing needs its own [u8 version][u32 length] wrapper on the wire, not
+// just the three raw fields back to back. The first implementation wrote the
+// raw fields directly; the client read the missing version byte as the top
+// of data's u32 count and desynced every field after it, surfacing as
+// 2306-0116 Core::BufferOverflow (the client overrunning its own read
+// buffer) the instant GetRanking answered — which is what was silently
+// killing the tournament-entry flow, not PostMetaBinary as first suspected.
+// Confirmed by cross-checking kinnay/NintendoClients' common.Structure.encode:
+// every Structure subclass gets this per-level header, RankingResult included.
+type rankingResult struct {
+	Total     uint32
+	SinceTime uint64
+}
+
+// Levels implements Structure. data (List<RankingRankData>) is always empty
+// today — no scores tracked yet, UploadScore just stores the raw submission
+// rather than feeding a ranking table — so it's written inline rather than
+// modeling RankingRankData for a case that never has elements yet.
+func (r *rankingResult) Levels() []Level {
+	return []Level{{
+		Save: func(o *StreamOut) {
+			WriteList(o, []struct{}{}, func(*StreamOut, struct{}) {}) // data: empty
+			o.U32(r.Total)
+			o.DateTime(r.SinceTime)
+		},
+	}}
+}
+
+// getRanking answers GetRanking with an empty leaderboard (see rankingResult
+// above for why it must be wrapped, not raw fields). Doesn't bother decoding
+// the request: nothing in it changes an empty answer, and every other method
+// in this file that reaches this point already tolerates a request it can't
+// fully interpret.
 func getRanking(conn *Connection, req *RMCMessage) *RMCMessage {
 	s := conn.Settings
 	out := NewStreamOut(s)
-	out.U32(0)                          // data: List<RankingRankData>, empty
-	out.U32(0)                          // total
-	out.DateTime(NowDateTime().Value()) // since_time
+	out.Add(&rankingResult{SinceTime: NowDateTime().Value()})
 	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, out.Bytes())
 }
 
