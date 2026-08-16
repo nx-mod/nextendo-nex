@@ -65,6 +65,18 @@ const (
 	// pattern as methodRankingGetCompetitionInfo/methodRankingCompetitionRanking.
 	MethodGetRanking uint32 = 0x9
 
+	// MethodGetCachedTopXRanking(category u32, RankingOrderParam) ->
+	// RankingCachedResult{RankingResult + created_time, expired_time DateTime;
+	// max_length u8}. Real bug found via live testing 2026-08-16: the Ranking
+	// screen's period filters (World/National/Friend Ranking x "Last Month" etc)
+	// use kinnay/NintendoClients' cached-topX variant instead of plain GetRanking
+	// — left unhandled it's Core::NotImplemented (2306-0103) the instant a
+	// period filter is picked, same signature as every other unanswered method
+	// in this file. RankingCachedResult inherits RankingResult, so on the wire
+	// it's TWO struct-header levels (base then derived) — same hierarchy framing
+	// as MatchmakeSession/Gathering (see types.go's WriteStructure comment).
+	MethodGetCachedTopXRanking uint32 = 0xE
+
 	// methodRankingGetCompetitionInfo : liste des tournois. Sur la capture,
 	// Nintendo rend 85 tournois ; sans tournoi chez nous, une liste vide.
 	methodRankingGetCompetitionInfo uint32 = 0x12
@@ -236,6 +248,8 @@ func RankingHandler() RMCHandler {
 			return uploadScore(conn, req)
 		case MethodGetRanking:
 			return getRanking(conn, req)
+		case MethodGetCachedTopXRanking:
+			return getCachedTopXRanking(conn, req)
 		case methodRankingCommonDataByPIDs:
 			return commonDataByPIDs(conn, req)
 		case methodRankingGetCompetitionInfo:
@@ -332,6 +346,52 @@ func getRanking(conn *Connection, req *RMCMessage) *RMCMessage {
 	s := conn.Settings
 	out := NewStreamOut(s)
 	out.Add(&rankingResult{SinceTime: NowDateTime().Value()})
+	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, out.Bytes())
+}
+
+// rankingCachedResult is GetCachedTopXRanking's response. It inherits
+// RankingResult (data/total/since_time) and adds its own level
+// (created_time, expired_time, max_length) — two struct-header levels on the
+// wire, base then derived, mirroring RankingResult/rankingResult above.
+type rankingCachedResult struct {
+	Total       uint32
+	SinceTime   uint64
+	CreatedTime uint64
+	ExpiredTime uint64
+	MaxLength   uint8
+}
+
+// Levels implements Structure. data is always empty, same reasoning as
+// rankingResult above.
+func (r *rankingCachedResult) Levels() []Level {
+	return []Level{
+		{ // RankingResult's level
+			Save: func(o *StreamOut) {
+				WriteList(o, []struct{}{}, func(*StreamOut, struct{}) {}) // data: empty
+				o.U32(r.Total)
+				o.DateTime(r.SinceTime)
+			},
+		},
+		{ // RankingCachedResult's own level
+			Save: func(o *StreamOut) {
+				o.DateTime(r.CreatedTime)
+				o.DateTime(r.ExpiredTime)
+				o.U8(r.MaxLength)
+			},
+		},
+	}
+}
+
+// getCachedTopXRanking answers the Ranking screen's period-filtered views
+// ("Last Month" etc) with an empty cached leaderboard — same "empty is a
+// legitimate answer, nothing tracked yet" reasoning as getRanking above.
+// Doesn't decode the request (category + RankingOrderParam): nothing in it
+// changes an empty answer.
+func getCachedTopXRanking(conn *Connection, req *RMCMessage) *RMCMessage {
+	s := conn.Settings
+	now := NowDateTime().Value()
+	out := NewStreamOut(s)
+	out.Add(&rankingCachedResult{SinceTime: now, CreatedTime: now, ExpiredTime: now})
 	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, out.Bytes())
 }
 
