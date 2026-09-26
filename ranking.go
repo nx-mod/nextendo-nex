@@ -32,6 +32,50 @@ import (
 const (
 	ProtocolRanking        uint16 = 0x70
 	MethodUploadCommonData uint32 = 0x4
+	// MethodGetCommonData(unique_id u64) -> Buffer: a single player's own common
+	// data, looked up by "unique ID" — which in this core IS the PID (see
+	// utility.go's AcquireNexUniqueID: it hands out uint64(conn.PID) verbatim,
+	// not a separate id space), so this reuses the same PID-keyed store
+	// UploadCommonData/commonDataByPIDs already maintain. Mario Tennis Aces
+	// calls this immediately after Register, before ever uploading anything —
+	// left unanswered it's Core::NotImplemented -> the client's generic
+	// 2306-0103 "an error has occurred", same signature already measured for
+	// Splatoon 2's CloseParticipation above. An empty Buffer (no data on file
+	// yet) is Nintendo's own answer for an unknown id, per commonDataByPIDs'
+	// comment below — not a placeholder.
+	MethodGetCommonData uint32 = 0x6
+
+	// MethodUploadScore(RankingScoreData{category,score,order,update_mode,groups[],
+	// param}, unique_id u64) -> empty ack. The STANDARD kinnay/NintendoClients wire
+	// number (1) for score submission — distinct from methodRankingSubmitScore (0x11)
+	// below, which is MK8's own measured number for the same concept. Mario Tennis
+	// Aces uses 1: both players call it simultaneously right after a match, same
+	// "unanswered -> 2306-0103" signature as everywhere else in this file.
+	MethodUploadScore uint32 = 0x1
+
+	// MethodGetRanking(mode u8, category u32, RankingOrderParam{order_calc,
+	// group_index, group_num, time_scope u8; offset u32; count u8}, unique_id u64,
+	// pid) -> RankingResult{data: List<RankingRankData>, total u32, since_time
+	// DateTime}. Real bug found via live testing 2026-08-16: Mario Tennis Aces
+	// calls this right after posting tournament entry data (DataStore
+	// PostMetaBinary); left unanswered it silently killed the client with no
+	// visible error for several reconnect attempts, matching the
+	// PostMetaBinary/2306-0116 investigation above. An empty result (no
+	// leaderboard data yet) is a valid, safe answer — same "empty is legitimate"
+	// pattern as methodRankingGetCompetitionInfo/methodRankingCompetitionRanking.
+	MethodGetRanking uint32 = 0x9
+
+	// MethodGetCachedTopXRanking(category u32, RankingOrderParam) ->
+	// RankingCachedResult{RankingResult + created_time, expired_time DateTime;
+	// max_length u8}. Real bug found via live testing 2026-08-16: the Ranking
+	// screen's period filters (World/National/Friend Ranking x "Last Month" etc)
+	// use kinnay/NintendoClients' cached-topX variant instead of plain GetRanking
+	// — left unhandled it's Core::NotImplemented (2306-0103) the instant a
+	// period filter is picked, same signature as every other unanswered method
+	// in this file. RankingCachedResult inherits RankingResult, so on the wire
+	// it's TWO struct-header levels (base then derived) — same hierarchy framing
+	// as MatchmakeSession/Gathering (see types.go's WriteStructure comment).
+	MethodGetCachedTopXRanking uint32 = 0xE
 
 	// methodRankingGetCompetitionInfo : liste des tournois. Sur la measured,
 	// Nintendo rend 85 tournois ; sans tournoi chez nous, une liste vide.
@@ -198,6 +242,14 @@ func RankingHandler() RMCHandler {
 		switch req.Method {
 		case MethodUploadCommonData:
 			return uploadCommonData(conn, req)
+		case MethodGetCommonData:
+			return getCommonData(conn, req)
+		case MethodUploadScore:
+			return uploadScore(conn, req)
+		case MethodGetRanking:
+			return getRanking(conn, req)
+		case MethodGetCachedTopXRanking:
+			return getCachedTopXRanking(conn, req)
 		case methodRankingCommonDataByPIDs:
 			return commonDataByPIDs(conn, req)
 		case methodRankingGetCompetitionInfo:
@@ -234,6 +286,128 @@ func uploadCommonData(conn *Connection, req *RMCMessage) *RMCMessage {
 		logCommonDataNames(conn.PID, blob)
 	}
 	return NewRMCSuccess(conn.Settings, ProtocolRanking, req.Method, req.CallID, nil)
+}
+
+// uploadScore answers the standard UploadScore(1): keep-and-ack, unconditionally
+// — like methodRankingSubmitScore below, NOT a hard decode. A first attempt at
+// strictly parsing kinnay/NintendoClients' documented RankingScoreData{category,
+// score,order,update_mode,groups[],param}+unique_id shape hard-failed with
+// Core::InvalidArgument for a real Mario Tennis Aces client (live-tested
+// 2026-08-16): its actual body doesn't match that layout exactly (extra/missing
+// field, or a different groups/param encoding — not yet decoded). Nintendo's own
+// server doesn't echo anything back here either way, so there's nothing riding
+// on getting the exact fields right immediately — store the raw body now,
+// decode it properly once captured, same as methodRankingSubmitScore already
+// does for MK8.
+func uploadScore(conn *Connection, req *RMCMessage) *RMCMessage {
+	s := conn.Settings
+	fmt.Printf("[Ranking] UploadScore pid=%d bodyLen=%d body=%x\n", conn.PID, len(req.Body), req.Body)
+	keepSubmittedScore(conn.PID, req.Method, req.Body)
+	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, nil)
+}
+
+// rankingResult is GetRanking's response. Real bug found via live testing
+// 2026-08-16: this method's return type is RankingResult, a Structure
+// (data List<RankingRankData>, total u32, since_time DateTime) — under NEX
+// 4.0's struct-header framing (types.go's WriteStructure) that means the
+// whole thing needs its own [u8 version][u32 length] wrapper on the wire, not
+// just the three raw fields back to back. The first implementation wrote the
+// raw fields directly; the client read the missing version byte as the top
+// of data's u32 count and desynced every field after it, surfacing as
+// 2306-0116 Core::BufferOverflow (the client overrunning its own read
+// buffer) the instant GetRanking answered — which is what was silently
+// killing the tournament-entry flow, not PostMetaBinary as first suspected.
+// Confirmed by cross-checking kinnay/NintendoClients' common.Structure.encode:
+// every Structure subclass gets this per-level header, RankingResult included.
+type rankingResult struct {
+	Total     uint32
+	SinceTime uint64
+}
+
+// Levels implements Structure. data (List<RankingRankData>) is always empty
+// today — no scores tracked yet, UploadScore just stores the raw submission
+// rather than feeding a ranking table — so it's written inline rather than
+// modeling RankingRankData for a case that never has elements yet.
+func (r *rankingResult) Levels() []Level {
+	return []Level{{
+		Save: func(o *StreamOut) {
+			WriteList(o, []struct{}{}, func(*StreamOut, struct{}) {}) // data: empty
+			o.U32(r.Total)
+			o.DateTime(r.SinceTime)
+		},
+	}}
+}
+
+// getRanking answers GetRanking with an empty leaderboard (see rankingResult
+// above for why it must be wrapped, not raw fields). Doesn't bother decoding
+// the request: nothing in it changes an empty answer, and every other method
+// in this file that reaches this point already tolerates a request it can't
+// fully interpret.
+func getRanking(conn *Connection, req *RMCMessage) *RMCMessage {
+	s := conn.Settings
+	out := NewStreamOut(s)
+	out.Add(&rankingResult{SinceTime: NowDateTime().Value()})
+	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, out.Bytes())
+}
+
+// rankingCachedResult is GetCachedTopXRanking's response. It inherits
+// RankingResult (data/total/since_time) and adds its own level
+// (created_time, expired_time, max_length) — two struct-header levels on the
+// wire, base then derived, mirroring RankingResult/rankingResult above.
+type rankingCachedResult struct {
+	Total       uint32
+	SinceTime   uint64
+	CreatedTime uint64
+	ExpiredTime uint64
+	MaxLength   uint8
+}
+
+// Levels implements Structure. data is always empty, same reasoning as
+// rankingResult above.
+func (r *rankingCachedResult) Levels() []Level {
+	return []Level{
+		{ // RankingResult's level
+			Save: func(o *StreamOut) {
+				WriteList(o, []struct{}{}, func(*StreamOut, struct{}) {}) // data: empty
+				o.U32(r.Total)
+				o.DateTime(r.SinceTime)
+			},
+		},
+		{ // RankingCachedResult's own level
+			Save: func(o *StreamOut) {
+				o.DateTime(r.CreatedTime)
+				o.DateTime(r.ExpiredTime)
+				o.U8(r.MaxLength)
+			},
+		},
+	}
+}
+
+// getCachedTopXRanking answers the Ranking screen's period-filtered views
+// ("Last Month" etc) with an empty cached leaderboard — same "empty is a
+// legitimate answer, nothing tracked yet" reasoning as getRanking above.
+// Doesn't decode the request (category + RankingOrderParam): nothing in it
+// changes an empty answer.
+func getCachedTopXRanking(conn *Connection, req *RMCMessage) *RMCMessage {
+	s := conn.Settings
+	now := NowDateTime().Value()
+	out := NewStreamOut(s)
+	out.Add(&rankingCachedResult{SinceTime: now, CreatedTime: now, ExpiredTime: now})
+	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, out.Bytes())
+}
+
+// getCommonData answers GetCommonData(unique_id): the caller's own stored
+// common data, or an empty Buffer if nothing's been uploaded yet.
+func getCommonData(conn *Connection, req *RMCMessage) *RMCMessage {
+	s := conn.Settings
+	in := NewStreamIn(req.Body, s)
+	uniqueID := in.U64()
+	if in.Err() != nil {
+		return NewRMCError(s, ProtocolRanking, req.CallID, ResultCoreInvalidArgument)
+	}
+	out := NewStreamOut(s)
+	out.Buffer(CommonData(uniqueID))
+	return NewRMCSuccess(s, ProtocolRanking, req.Method, req.CallID, out.Bytes())
 }
 
 // commonDataByPIDs rend, pour chaque PID demandé et DANS L'ORDRE, le profil

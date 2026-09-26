@@ -15,11 +15,15 @@ const (
 	ProtocolMatchMakingExt     uint16 = 0x32
 
 	// MatchMaking (0x15)
-	MethodUnregisterGathering     uint32 = 0x02
+	MethodUnregisterGathering uint32 = 0x02
+	// GetDetailedParticipants(gid) -> List<ParticipantDetails>: the lobby screen's participant
+	// list. Left unanswered (NotImplemented), SMB35's post-matchmake lobby screen dies with
+	// 2306-0103 — the exact same "unanswered call -> 2306-0103" signature already measured for
+	// Splatoon 2's CloseParticipation below, so this generalizes across titles, not SMB35-specific.
+	MethodGetDetailedParticipants uint32 = 0x0F // 15
 	MethodFindBySingleID15        uint32 = 0x15
 	MethodUpdateSessionURL        uint32 = 0x1B
 	MethodUpdateSessionHostV1     uint32 = 0x28
-	MethodGetDetailedParticipants uint32 = 0x0F
 	MethodGetSessionURLs          uint32 = 0x29
 	MethodUpdateSessionHost       uint32 = 0x2A
 
@@ -71,10 +75,17 @@ const (
 	MethodUpdateMatchmakeSessionPart     uint32 = 0x2C
 	MethodUpdateProgressScore            uint32 = 0x22
 	MethodFindMatchmakeSessionBySingleID uint32 = 0x31
-	MethodCustomPlayingSession           uint32 = 0x3C
-	MethodCustomFriendsQuery             uint32 = 0x41
-	MethodCustomPrivateRoomCreate        uint32 = 0x44
-	MethodCustomResolveCode              uint32 = 0x45
+	// FindMatchmakeSessionByGatheringIDDetail(gid u32) -> MatchmakeSession, unscrubbed
+	// (unlike FindMatchmakeSessionBySingleID, which strips the session key/password for
+	// an outside browse-style lookup — see findBySingleID below). Mario Tennis Aces calls
+	// this on its own just-created gathering right after ReplaceURL, presumably to read
+	// back its own fully-resolved session; left unanswered it's the same "generic
+	// NotImplemented -> 2306-0103" signature as everything else in this file.
+	MethodFindMatchmakeSessionByGatheringIDDetail uint32 = 0x29
+	MethodCustomPlayingSession                    uint32 = 0x3C
+	MethodCustomFriendsQuery                      uint32 = 0x41
+	MethodCustomPrivateRoomCreate                 uint32 = 0x44
+	MethodCustomResolveCode                       uint32 = 0x45
 
 	// SSBU (Super Smash Bros Ultimate) arena methods. MK8 never calls these, so
 	// registering them is harmless to MK8; they reuse the same in-memory store.
@@ -167,6 +178,15 @@ type Matchmaking struct {
 	// data use it to publish on the host's behalf. nil by default, so the titles that
 	// publish themselves are unchanged.
 	OnFriendSessionCreated func(pid uint64, gid uint32)
+	// OnParticipantJoined, when set, is called at the end of notifyParticipation —
+	// once per pid that successfully joins a gathering, whether via autoMatchmake,
+	// createSession's implicit host self-join, or joinSession. Titles whose actual
+	// gameplay traffic doesn't go through this server's own P2P/NAT-traversal path
+	// use it to hand the joiner something else instead, e.g. SMB35 starts (or
+	// reuses) that gathering's Eagle relay session here and pushes the joiner its
+	// wss:// URL + token via a notification event. nil by default, so titles that
+	// don't set it are unchanged.
+	OnParticipantJoined func(gid uint32, pid uint64)
 
 	notif *notifStore
 	mu    sync.Mutex
@@ -255,6 +275,8 @@ func (m *Matchmaking) ExtensionHandler() RMCHandler {
 			return m.resolveCode(conn, req)
 		case MethodFindByGidList:
 			return m.findByGidList(conn, req)
+		case MethodFindMatchmakeSessionByGatheringIDDetail:
+			return m.findByGatheringIDDetail(conn, req)
 		case MethodBrowseNoHolder:
 			return m.browseNoHolder(conn, req)
 		case MethodSSBUPreMatch:
@@ -517,6 +539,9 @@ func (m *Matchmaking) notifyParticipation(caller *Connection, participants []uin
 	// ce titre le rappel est nil et rien ne change.
 	if m.OnSessionReady != nil {
 		m.OnSessionReady(gid, participants)
+	}
+	if m.OnParticipantJoined != nil {
+		m.OnParticipantJoined(gid, caller.PID)
 	}
 }
 
@@ -804,6 +829,30 @@ func (m *Matchmaking) joinSession(conn *Connection, req *RMCMessage) *RMCMessage
 	if joined {
 		m.notifyParticipationWithDelay(conn, parts, gid)
 	}
+	return NewRMCSuccess(s, ProtocolMatchmakeExtension, req.Method, req.CallID, out.Bytes())
+}
+
+// findByGatheringIDDetail answers FindMatchmakeSessionByGatheringIDDetail: the
+// full, unscrubbed session (unlike findBySingleID's browse-style lookup) —
+// for a caller reading back its own gathering's resolved state.
+func (m *Matchmaking) findByGatheringIDDetail(conn *Connection, req *RMCMessage) *RMCMessage {
+	s := conn.Settings
+	gid := NewStreamIn(req.Body, s).U32()
+
+	m.mu.Lock()
+	g := m.gatherings[gid]
+	var result *MatchmakeSession
+	if g != nil {
+		r := *g.session
+		result = &r
+	}
+	m.mu.Unlock()
+
+	if result == nil {
+		return NewRMCError(s, ProtocolMatchmakeExtension, req.CallID, ResultRendezVousSessionVoid)
+	}
+	out := NewStreamOut(s)
+	out.Add(result)
 	return NewRMCSuccess(s, ProtocolMatchmakeExtension, req.Method, req.CallID, out.Bytes())
 }
 
